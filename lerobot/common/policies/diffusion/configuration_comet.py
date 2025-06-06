@@ -15,6 +15,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass, field
+import torch
+from typing import Callable, Optional, Union
 
 from lerobot.common.optim.optimizers import AdamConfig
 from lerobot.common.optim.schedulers import DiffuserSchedulerConfig
@@ -22,9 +24,9 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode, PolicyFeature, FeatureType
 
 
-@PreTrainedConfig.register_subclass("dipcom")
+@PreTrainedConfig.register_subclass("comet")
 @dataclass
-class DipcomConfig(PreTrainedConfig):
+class CometConfig(PreTrainedConfig):
     """Configuration class for DipcomPolicy.
 
     Defaults are configured for training with PushT providing proprioceptive and single camera observations.
@@ -116,35 +118,11 @@ class DipcomConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.MIN_MAX,
         }
     )
-    
-    #TODO(malek) check if the below is necessary
-    #replace with property method 
-    # keys_order: dict[str, list[str]] = field(
-    #     default_factory=lambda: {
-    #         "action": ['action'],
-    #         "state": ['observation.state']
-    #     }
-    # )
-    # input_shapes: dict[str, list[int]] = field(
-    #     default_factory=lambda: {
-    #         "observation.image": [3, 480, 640],
-    #         "observation.state": [6],
-    #     }
-    # )
-    # output_shapes: dict[str, list[int]] = field(
-    #     default_factory=lambda: {
-    #         "action": [6],
-    #     }
-    # )
-    ################################
 
     # The original implementation doesn't sample frames for the last 7 steps,
     # which avoids excessive padding and leads to improved training results.
     drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
 
-    # Architecture / modeling.
-    # Model to Use 
-    model: str = "PLAIN_TRANSFORMER"
     # Vision backbone.
     vision_backbone: str = "resnet18"
     crop_shape: tuple[int, int] | None = (84, 84)
@@ -153,22 +131,17 @@ class DipcomConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+    
+    # Architecture / modeling.
+    # Model to Use 
+    model: str = "PLAIN_TRANSFORMER"
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
-    # Noise scheduler.
-    noise_scheduler_type: str = "DDPM"
-    num_train_timesteps: int = 100
-    beta_schedule: str = "squaredcos_cap_v2"
-    beta_start: float = 0.0001
-    beta_end: float = 0.02
-    prediction_type: str = "epsilon"
-    clip_sample: bool = True
-    clip_sample_range: float = 1.0
-    
+
     # Transformer
     n_layer: int = 8
     n_head: int = 4
@@ -193,6 +166,40 @@ class DipcomConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-6
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
+    
+    # ---------------- SDE ---------------------------
+    # Noise scheduler.
+    prediction_type: str = "epsilon"
+    #---------------------------------------------
+    noise_schedule: str = 'cosine'
+    epsilon: float = 1e-3
+    noise_schedule_params: dict | None = None
+    # predict_noise: bool = True # change it to a property function that depends on the prediction_type
+    solver: str = "sde_dpmsolver++_2M"
+    # ----------------- sampling ----------------- #
+    n_samples: int = 1
+    sample_steps: int = 10
+    sample_step_schedule: Union[str, Callable] = "uniform_continuous"
+    temperature: float = 1.0
+    # ------------------ guidance ------------------ # need to understand whats going on here
+    condition_cfg: None = None
+    mask_cfg: None = None
+    w_cfg: float = 1
+    condition_cg: None = None
+    w_cg: float = 0.0
+    # ----------- Diffusion-X sampling ----------
+    diffusion_x_sampling_steps: int = 0
+    # ----------- Warm-Starting -----------
+    warm_start_reference: torch.Tensor | None = None
+    warm_start_forward_level: float = 0.3
+    # ------------------ others ------------------ #
+    requires_grad: bool = False
+    preserve_history: bool = False
+    
+    classifier: None = None
+    x_max: torch.Tensor | None = None
+    x_min: torch.Tensor | None = None
+    
 
     def __post_init__(self):
         super().__post_init__()
@@ -208,12 +215,12 @@ class DipcomConfig(PreTrainedConfig):
             raise ValueError(
                 f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
             )
-        supported_noise_schedulers = ["DDPM", "DDIM"]
-        if self.noise_scheduler_type not in supported_noise_schedulers:
-            raise ValueError(
-                f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
-                f"Got {self.noise_scheduler_type}."
-            )
+        # supported_noise_schedulers = ["DDPM", "DDIM"]
+        # if self.noise_scheduler_type not in supported_noise_schedulers:
+        #     raise ValueError(
+        #         f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
+        #         f"Got {self.noise_scheduler_type}."
+        #     )
 
         # Check that the horizon size and U-Net downsampling is compatible.
         # U-Net downsamples by 2 with each stage.
@@ -259,6 +266,15 @@ class DipcomConfig(PreTrainedConfig):
                     f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
                 )
 
+    @property
+    def predict_noise(self) -> bool:
+        if self.prediction_type == "epsilon":
+            return True
+        elif self.prediction_type == "sample":
+            return False
+        else:
+            raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
+    
     @property
     def observation_delta_indices(self) -> list:
         return list(range(1 - self.n_obs_steps, 1))
